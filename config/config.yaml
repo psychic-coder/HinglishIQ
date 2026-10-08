@@ -1,0 +1,52 @@
+# HinglishIQ configuration. Paths are relative to the project root.
+
+llm:
+  # IMPORTANT: confirm the current FREE-tier Flash / Flash-Lite model name in
+  # Google AI Studio (https://aistudio.google.com) before running in real mode.
+  # Free-tier models only - never configure a Pro model here.
+  model: "gemini-3.5-flash-lite"
+  temperature: 0.0
+  max_output_tokens: 512
+  # Optional thinking budget (tokens). null = model default. 0 disables
+  # thinking on models that support it (saves free-tier tokens).
+  thinking_budget: null
+
+reliability:
+  rate_limit_rpm: 10          # client-side requests per minute (free tier is tight)
+  max_concurrency: 2          # parallel in-flight API calls
+  max_retries: 4              # retries on 429 / 5xx / RESOURCE_EXHAUSTED
+  backoff_base_seconds: 2.0   # delay = base * 2^attempt + jitter
+  backoff_max_seconds: 60.0
+  cache_dir: ".cache"
+
+paths:
+  data_dir: "data"
+  samples_file: "data/samples.jsonl"
+  prompts_dir: "prompts"
+  results_dir: "results"
+  baseline_model: "models/baseline.joblib"
+
+split:
+  train: 0.5
+  dev: 0.2
+  test: 0.3
+
+random_seed: 42
+default_prompt_version: "v3"
+
+evaluation:
+  # code-mix ratio bins: low < low_max <= med < med_max <= high
+  codemix_low_max: 0.50
+  codemix_med_max: 0.65
+
+baseline:
+  ngram_min: 2
+  ngram_max: 5
+  C: 5.0
+  max_iter: 2000
+
+mock:
+  # Deterministic fake LLM used by --mock, tests and the UI without a key.
+  model_name: "mock-hinglish-rules"
+  rate_limit_rpm: 0           # 0 = no client-side limiting in mock mode
+  simulated_latency_ms: 5

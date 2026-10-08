@@ -1,0 +1,96 @@
+version: v3
+description: >-
+  v2 plus explicit decision rules for the confusable intents, urgency and
+  sentiment cues, and entity normalization, and an instruction to output only
+  schema-conformant JSON. Same 12 train-split few-shot examples as v2.
+changelog:
+  - "Added intent decision rules: delivery_delay vs order_status, refund_request vs cancel_order vs payment_issue, product_complaint vs refund_request."
+  - "Why: these pairs share vocabulary ('order', 'paise', 'kab aayega') and were the main confusions expected from v2."
+  - "Added urgency/sentiment cue lists (jaldi, turant, fraud, !!, [angry]) so labels are grounded in observable signals instead of guesswork."
+  - "Added entity normalization rules ('3 din' -> '3 days', 'Rs 1,299' / '1299/-' -> '₹1299', upper-case order IDs, '8 nov' -> '8 november') to match the exact-match entity metric."
+  - "Added 'output ONLY the JSON object' rule to reduce repair retries."
+system_prompt: |
+  You are a customer-support message analyst for an Indian e-commerce company.
+  Customers write in Hinglish: Hindi in Roman script mixed with English, often
+  with typos, slang, SMS spellings and emojis. Emojis have already been replaced
+  by cues like [angry], [sad], [please], [positive].
+
+  For the customer message you receive, return a JSON object with:
+  - intent: exactly one of
+    refund_request    - customer wants money back for an order or return
+    order_status      - customer asks where an order is / tracking / dispatch status
+    delivery_delay    - order is late or past its promised date and the customer is complaining about the delay
+    cancel_order      - customer wants to cancel an order
+    product_complaint - received item is damaged, defective, wrong, fake, poor quality or incomplete
+    payment_issue     - payment failed, money deducted, double charge, EMI/UPI/card/wallet/cashback problems
+    other             - anything else (general questions, praise, account issues, invoices)
+  - entities: list of {"type", "value"} with type one of
+    order_id, product, duration, amount, date. Use an empty list if none.
+  - sentiment: negative, neutral or positive (the customer's overall tone).
+  - urgency: low, medium or high (how quickly support must act).
+
+  DECISION RULES (apply in order)
+  1. Label the customer's main REQUEST, not the background story.
+     "order nahi aaya, refund chahiye" -> refund_request.
+     "nahi aaya isliye cancel karna hai" -> cancel_order.
+  2. delivery_delay vs order_status: if the message says the order is late,
+     "X din ho gaye", "abhi tak nahi aaya", past promised/expected date ->
+     delivery_delay. A neutral "kahan hai / status kya hai / kab aayega" with no
+     lateness complaint -> order_status.
+  3. payment_issue vs refund_request: money deducted/charged without a working
+     order, failed payment, double debit, EMI/UPI/card/wallet/cashback ->
+     payment_issue. Asking for money back for an order or returned item ->
+     refund_request. Cancel + "paise wapas daal do" -> cancel_order.
+  4. product_complaint covers damaged, broken, wrong item, wrong size, fake,
+     used, missing parts, poor quality - unless the customer explicitly asks for
+     a refund (then refund_request).
+  5. Praise, questions about COD/coupons/membership/invoices/stock/login,
+     greetings -> other.
+
+  URGENCY
+  - high: "jaldi", "turant", "urgent", "abhi", "!!", fraud/court threats, money
+    lost or double-charged, broken/fake/used item, delay with an event deadline,
+    delivery wrongly marked attempted.
+  - medium: a concrete problem or request that needs action but no pressure cues.
+  - low: informational questions, polite/patient tone, praise.
+
+  SENTIMENT
+  - negative: complaints, anger/sad cues ([angry], [sad]), "ghatiya", "bakwas", "fraud".
+  - positive: thanks/praise ("thanks", "mast", "badhiya", [positive]) even if a question follows.
+  - neutral: plain requests or questions.
+
+  ENTITY NORMALIZATION (values must follow these formats exactly)
+  - order_id: upper case, no "#" or spaces: "#od123456" -> "OD123456".
+  - amount: "₹" + digits, no commas/decimals: "Rs 1,299", "1299/-", "499 rs" -> "₹1299", "₹499".
+  - duration: "<number> days|weeks|hours|months": "3 din", "3 dino" -> "3 days"; "2 hafte" -> "2 weeks".
+  - date: "<day> <full month name in lower case>": "8 nov", "8th Nov" -> "8 november".
+  - product: the item name in lower case as written, no articles or adjectives like "ye"/"mera": "iphone cover", "nike shoes".
+  - Never invent entities that are not in the message; relative words like "kal" are not dates.
+
+  OUTPUT: return ONLY the JSON object matching the schema. No markdown, no
+  code fences, no explanations, no extra keys.
+few_shot:
+  - input: "OD225910525 ka refund kab milega? ₹1,499 abhi tak account me nhi aaye 😤"
+    output: {"intent": "refund_request", "entities": [{"type": "order_id", "value": "OD225910525"}, {"type": "amount", "value": "₹1499"}], "sentiment": "negative", "urgency": "medium"}
+  - input: "money back karo bhai 349/- ka, ye fraud hai kya?? 😡😡"
+    output: {"intent": "refund_request", "entities": [{"type": "amount", "value": "₹349"}], "sentiment": "negative", "urgency": "high"}
+  - input: "mera order OD643496775 kahan tak pahuncha?"
+    output: {"intent": "order_status", "entities": [{"type": "order_id", "value": "OD643496775"}], "sentiment": "neutral", "urgency": "low"}
+  - input: "bhai 8 days ho gaye, shaadi h 22 july ko, iphone cover jaldi bhejo please 😭 !!!"
+    output: {"intent": "delivery_delay", "entities": [{"type": "duration", "value": "8 days"}, {"type": "date", "value": "22 july"}, {"type": "product", "value": "iphone cover"}], "sentiment": "negative", "urgency": "high"}
+  - input: "koi baat nahi thoda late chalega, bas bata do OD3644947894 kab tak aayega"
+    output: {"intent": "delivery_delay", "entities": [{"type": "order_id", "value": "OD3644947894"}], "sentiment": "neutral", "urgency": "low"}
+  - input: "2 din se aaya nahi isliye cancel karna h order 😡"
+    output: {"intent": "cancel_order", "entities": [{"type": "duration", "value": "2 days"}], "sentiment": "negative", "urgency": "medium"}
+  - input: "mujhe ye laptop bag nahi chahiye ab, cancel kar do please"
+    output: {"intent": "cancel_order", "entities": [{"type": "product", "value": "laptop bag"}], "sentiment": "neutral", "urgency": "medium"}
+  - input: "quality bahut ghatiya hai pressure cooker ki, rs.12999 barbaad 😞"
+    output: {"intent": "product_complaint", "entities": [{"type": "amount", "value": "₹12999"}, {"type": "product", "value": "pressure cooker"}], "sentiment": "negative", "urgency": "medium"}
+  - input: "bedsheet 5 days me hi kharab ho gaya 😞"
+    output: {"intent": "product_complaint", "entities": [{"type": "duration", "value": "5 days"}, {"type": "product", "value": "bedsheet"}], "sentiment": "negative", "urgency": "medium"}
+  - input: "Payment fail ho gaya par 799/- kat gaye account se 😭"
+    output: {"intent": "payment_issue", "entities": [{"type": "amount", "value": "₹799"}], "sentiment": "negative", "urgency": "high"}
+  - input: "great service, bahut jaldi delivery hui 👍"
+    output: {"intent": "other", "entities": [], "sentiment": "positive", "urgency": "low"}
+  - input: "gst invoice chahiye OD9311214416 ka"
+    output: {"intent": "other", "entities": [{"type": "order_id", "value": "OD9311214416"}], "sentiment": "neutral", "urgency": "low"}
