@@ -269,3 +269,435 @@ python main.py predict "bhai mera order 3 din se nahi aaya, refund chahiye"
 python main.py evaluate --split dev
 python main.py evaluate --split test
 ```
+
+---
+
+## Project purpose
+
+HinglishIQ is a small, reproducible benchmark and demonstration system for classifying customer-support messages written in code-mixed Hindi and English. It is designed around four practical requirements:
+
+1. **Noisy input:** customers use Roman-script Hindi, English, abbreviations, spelling mistakes, repeated punctuation, emojis, and inconsistent casing.
+2. **Structured decisions:** downstream support workflows need a stable intent, entities, sentiment, and urgency rather than an unconstrained paragraph.
+3. **Reliable LLM integration:** API calls need validation, retries, rate limiting, caching, and an offline mode.
+4. **Measurable improvement:** prompt changes should be compared against a classical baseline on held-out data.
+
+The project is an experiment and reference implementation, not a production support router. The dataset is synthetic and the output should be reviewed before being used for customer-facing automation.
+
+## End-to-end lifecycle
+
+For one message, the application follows this sequence:
+
+1. The caller supplies raw text through the CLI or Streamlit UI.
+2. `src.preprocess` applies Unicode normalization, lowercase conversion, emoji cue replacement, elongation and punctuation cleanup, slang normalization, order-ID restoration, whitespace normalization, tokenization, and code-mix estimation.
+3. The pipeline sends the normalized text to either `GeminiBackend` or `MockBackend`.
+4. `LLMClient` checks the disk cache, applies the rate limiter and concurrency semaphore, and calls the backend.
+5. Transient failures are retried with exponential backoff and jitter. Non-retryable errors fail fast.
+6. The response is parsed as JSON and validated against the Pydantic `Extraction` model.
+7. Invalid JSON receives exactly one repair request. If repair also fails, the safe fallback is `other`, no entities, neutral sentiment, and low urgency.
+8. A `PredictionResult` records the extraction and telemetry.
+9. The CLI serializes the result, while the UI translates it into a readable support summary.
+
+The evaluation path uses the same preprocessing and prediction pipeline, then compares predictions with gold labels and writes metrics, confusion matrices, and error records.
+
+## Output contract
+
+Every successful prediction has this shape:
+
+```json
+{
+  "intent": "refund_request",
+  "entities": [
+    {"type": "duration", "value": "3 days"}
+  ],
+  "sentiment": "negative",
+  "urgency": "high"
+}
+```
+
+### Intent labels
+
+| Label | Meaning |
+|---|---|
+| `refund_request` | The customer asks for money back or a refund. |
+| `order_status` | The customer asks where an order is or when it will arrive. |
+| `delivery_delay` | The customer reports that an expected delivery is late. |
+| `cancel_order` | The customer wants an order cancelled. |
+| `product_complaint` | The customer reports a damaged, defective, missing, or poor-quality product. |
+| `payment_issue` | The customer reports a failed, duplicate, missing, or incorrect payment or charge. |
+| `other` | No supported intent is sufficiently clear. |
+
+Prompt rules make the distinction between similar labels explicit. For example, a request for a refund takes precedence over a delivery complaint when both appear, and a payment charge problem is distinct from a refund request.
+
+### Entity labels
+
+| Type | Canonical examples | Extracted by regex baseline |
+|---|---|---|
+| `order_id` | `OD48213377` | Yes |
+| `product` | `mixer grinder` | No; the LLM or mock rules can provide it |
+| `duration` | `3 days`, `2 weeks` | Yes |
+| `amount` | `₹1299` | Yes |
+| `date` | `8 november` | Yes |
+
+Entity scoring compares exact `(type, normalized value)` pairs. The displayed value is expected to be canonical, not necessarily a verbatim substring of the message.
+
+### Sentiment and urgency
+
+Sentiment is one of `negative`, `neutral`, or `positive`. Urgency is one of `low`, `medium`, or `high`. These are classification labels, not calibrated probabilities. The system intentionally does not return confidence scores because the current models do not provide a validated confidence estimate.
+
+## Preprocessing reference
+
+`preprocess(text)` returns `PreprocessResult` with `original`, normalized `text`, token tuple, and `code_mix_ratio`.
+
+| Operation | Example |
+|---|---|
+| Unicode NFKC | Normalizes compatible Unicode forms. |
+| Lowercase | `PLEASE help` becomes `please help`. |
+| Emoji cues | Angry emojis become `[angry]`; positive emojis become `[positive]`; prayer emojis become `[please]`. |
+| Elongation cleanup | `pleaseeee` becomes `pleasee`. |
+| Punctuation cleanup | Long runs such as `!!!!` are shortened to `!!`. |
+| Slang normalization | `nhi`, `kr`, `jldi`, and `plz` become canonical forms such as `nahi`, `kar`, `jaldi`, and `please`. |
+| ID restoration | `od 48213377` becomes `OD48213377`. |
+| Whitespace normalization | Repeated spaces are collapsed. |
+
+The code-mix ratio is the fraction of alphabetic tokens found in the built-in Romanized-Hindi lexicon. It is a diagnostic feature and evaluation grouping, not a language detector. Ambiguous words and unseen slang can make it imperfect.
+
+## Entity normalization reference
+
+`src/entities.py` canonicalizes values before exact-match scoring:
+
+| Input forms | Canonical value |
+|---|---|
+| `OD 48213377`, `#ord-48213377` | `OD48213377` |
+| `Rs. 1,299`, `1299 rupees`, `₹1,299` | `₹1299` |
+| `3 din`, `3 days` | `3 days` |
+| `2 hafta`, `2 weeks` | `2 weeks` |
+| `8 nov`, `8th November` | `8 november` |
+
+The regex extractor scans order IDs, amounts, durations, and dates. It de-duplicates identical normalized entities. Product extraction is intentionally left to the LLM/mock path because product names are open-ended.
+
+## Baseline model
+
+The baseline is deliberately simple and inspectable:
+
+- Input: preprocessed message text.
+- Features: character-boundary TF-IDF n-grams, default range 2 through 5.
+- Classifier: one balanced `LogisticRegression` pipeline per head: intent, sentiment, and urgency.
+- Entities: deterministic regex extraction from the raw/preprocessed text.
+- Persistence: the three scikit-learn pipelines are saved with `joblib`.
+
+Train it with:
+
+```bash
+python main.py split
+python main.py train-baseline
+```
+
+The saved file defaults to `models/baseline.joblib`. The UI can still run without it, but it will show that the baseline has not been trained. Evaluation requires the saved baseline.
+
+## LLM client behavior
+
+`LLMClient` is the reliability boundary around either backend.
+
+### Cache
+
+Successful responses are stored under `reliability.cache_dir`, default `.cache/`. The SHA-256 cache key includes:
+
+- model name;
+- temperature;
+- the full prompt file content hash; and
+- normalized input text.
+
+Changing a prompt file invalidates only entries for that prompt. Failed calls are not cached. Cache hits report zero input and output tokens and zero backend API calls for that request.
+
+### Retries and repair
+
+The client retries HTTP 429, `RESOURCE_EXHAUSTED`, HTTP 5xx, timeouts, and connection failures. Backoff is exponential with additive random jitter and a configured maximum. Invalid response JSON is a separate validation path and receives one repair attempt; it is not retried indefinitely.
+
+Bad requests, invalid keys, permission errors, and unknown models are classified as non-retryable API errors. The UI maps common errors to plain-language guidance and never silently changes real mode to mock mode.
+
+### Concurrency
+
+`aextract_many` runs calls with `asyncio.gather`, bounded by a semaphore and a requests-per-minute limiter. The Gemini SDK call itself is synchronous and runs in a worker thread with `asyncio.to_thread`. Loop-local locks and semaphores allow the same client design to work across repeated CLI and Streamlit event loops.
+
+### Gemini structured output compatibility
+
+The Pydantic model is used for local validation. Before it is sent to Gemini, `src.backends._gemini_response_schema()` recursively removes `additionalProperties` from the generated JSON Schema. Gemini's API rejects that keyword even though it is valid JSON Schema and is emitted by Pydantic for `extra="forbid"` models.
+
+## Configuration reference
+
+The default file is `config/config.yaml`. `src.config.load_config` validates the complete document with Pydantic, rejects unknown top-level fields, resolves relative paths against the project root, and rejects model names containing `pro` because the project targets free-tier Flash models.
+
+| Path | Default | Purpose |
+|---|---:|---|
+| `llm.model` | `gemini-3.5-flash-lite` | Gemini model ID for real mode. Verify current availability before use. |
+| `llm.temperature` | `0.0` | Deterministic structured generation. |
+| `llm.max_output_tokens` | `512` | Maximum generated output. |
+| `llm.thinking_budget` | `null` | Optional Gemini thinking-token budget. |
+| `reliability.rate_limit_rpm` | `10` | Local requests-per-minute pacing. `0` disables pacing. |
+| `reliability.max_concurrency` | `2` | Maximum in-flight requests. |
+| `reliability.max_retries` | `4` | Retries after the initial call. |
+| `reliability.backoff_base_seconds` | `2.0` | Initial retry delay plus jitter. |
+| `reliability.backoff_max_seconds` | `60.0` | Maximum retry delay. |
+| `reliability.cache_dir` | `.cache` | Disk cache location. |
+| `paths.data_dir` | `data` | Generated train/dev/test directory. |
+| `paths.samples_file` | `data/samples.jsonl` | Source dataset. |
+| `paths.prompts_dir` | `prompts` | Prompt YAML directory. |
+| `paths.results_dir` | `results` | Evaluation output directory. |
+| `paths.baseline_model` | `models/baseline.joblib` | Saved baseline path. |
+| `split.train/dev/test` | `0.5/0.2/0.3` | Stratified split proportions. |
+| `random_seed` | `42` | Split, classifier, and mock determinism. |
+| `default_prompt_version` | `v3` | Prompt selected by default. |
+| `evaluation.codemix_low_max` | `0.50` | Upper bound for the low bin. |
+| `evaluation.codemix_med_max` | `0.65` | Upper bound for the medium bin. |
+| `baseline.ngram_min/max` | `2/5` | Character n-gram range. |
+| `baseline.C` | `5.0` | Logistic regression regularization. |
+| `baseline.max_iter` | `2000` | Classifier iteration limit. |
+| `mock.model_name` | `mock-hinglish-rules` | Model label used in mock telemetry/cache keys. |
+| `mock.rate_limit_rpm` | `0` | Mock-mode request pacing. |
+| `mock.simulated_latency_ms` | `5` | Deterministic mock delay. |
+
+For a different configuration:
+
+```bash
+python main.py --config path/to/config.yaml predict "order kahan hai" --mock
+```
+
+## Data format
+
+### Source and split JSONL
+
+Each line in `data/samples.jsonl` and its generated split files is a JSON object:
+
+```json
+{
+  "id": "sample-001",
+  "text": "bhai mera order 3 din se nahi aaya",
+  "intent": "delivery_delay",
+  "entities": [{"type": "duration", "value": "3 days"}],
+  "sentiment": "neutral",
+  "urgency": "medium"
+}
+```
+
+`id` is a stable sample identifier, `text` is the raw message, and the remaining fields are the gold `Extraction`. The loader validates every line with Pydantic and reports malformed JSON or schema violations as `DataError`.
+
+### Prompt YAML
+
+Each prompt file has this conceptual shape:
+
+```yaml
+version: v3
+description: Schema and decision rules
+changelog:
+  - Added ordered intent rules
+system_prompt: |
+  ...
+few_shot:
+  - input: "message"
+    output:
+      intent: other
+      entities: []
+      sentiment: neutral
+      urgency: low
+```
+
+Few-shot outputs must satisfy the same extraction schema as live responses. Few-shot inputs are preprocessed before rendering so training examples and live requests use the same normalization path.
+
+## CLI reference
+
+### `split`
+
+Creates stratified `train.jsonl`, `dev.jsonl`, and `test.jsonl` under `paths.data_dir`. The configured proportions and seed are used. The examples referenced by prompt few-shot sets are pinned to the train split to prevent prompt leakage into dev or test.
+
+### `train-baseline`
+
+Loads the train split, fits the three classifier heads, and writes the joblib model. Run this after changing the split or baseline configuration.
+
+### `predict`
+
+Analyzes one raw message. Options:
+
+- `--prompt VERSION`: select a discovered prompt, such as `v2`.
+- `--mock`: use the deterministic offline backend.
+- `--config PATH`: use a different configuration file.
+- `-v` or `--verbose`: enable debug logging.
+
+Exit code is `0` for a successful call, `1` for configuration/input setup errors, and `2` when the LLM call fails and the output is a fallback.
+
+### `evaluate`
+
+Runs the baseline and selected prompt versions on `dev` or `test`, then writes all report artifacts. Options:
+
+- `--mock`: produce an offline report and label it MOCK MODE.
+- `--split dev|test`: choose the evaluation split; train is intentionally rejected.
+- `--prompts v1,v2`: evaluate only selected prompt versions.
+- `--limit N`: evaluate only the first N samples after loading the split.
+
+Use dev for prompt iteration. Use test only after prompts and rules are frozen.
+
+## Evaluation methodology
+
+For each method, the evaluator computes:
+
+- intent accuracy and macro-F1;
+- sentiment macro-F1;
+- urgency macro-F1;
+- micro entity precision, recall, and F1 over normalized `(type, value)` pairs;
+- JSON validity for LLM methods;
+- latency p50 and p95;
+- average tokens per sample;
+- cache hit rate, API calls, retries, and errors; and
+- intent accuracy in low, medium, and high code-mix bins.
+
+The baseline receives JSON validity of 100% and zero token/API counts because it is not an LLM. LLM JSON validity includes responses that become valid after the one repair request. A failed request is invalid and is represented by the safe fallback in error artifacts.
+
+## Generated artifacts
+
+After `evaluate`, `results/` contains:
+
+| File pattern | Contents |
+|---|---|
+| `metrics.json` | Machine-readable report, model, mode, timestamp, and all metrics. |
+| `metrics.md` | Human-readable Markdown report. |
+| `confusion_<method>.png` | Intent confusion matrix for each method. |
+| `errors_<method>.jsonl` | Samples with mismatched fields, invalid JSON, or API errors. |
+
+Error records include the sample ID, raw and preprocessed text, code-mix ratio, gold extraction, predicted extraction, validity, and error message. This makes prompt debugging possible without re-running the whole benchmark.
+
+## Streamlit UI reference
+
+Start the application with:
+
+```bash
+streamlit run app.py
+```
+
+The app runs in mock mode by default when `GEMINI_API_KEY` is absent. It does not silently fall back from real mode to mock mode.
+
+### Try it workflow
+
+1. Choose a prompt version.
+2. Leave mock mode enabled for offline exploration, or disable it after configuring a valid key and model.
+3. Choose an example message or enter a custom message.
+4. Select **Run**.
+5. Read the plain-language request summary, mood, priority, and detected details.
+6. Enable **Developer details** only when raw JSON, latency, token counts, preprocessing, or baseline diagnostics are needed.
+
+The UI's readable labels are presentation-only. The underlying contract remains the exact `Extraction` schema used by the CLI and evaluator.
+
+### Results tab
+
+The Results tab displays the latest `results/metrics.md` and all confusion-matrix PNGs. If no report exists, it explains which evaluation command to run.
+
+### Prompts tab
+
+The Prompts tab displays the selected prompt's description, changelog, few-shot count, and full system prompt. This is intended for prompt auditing and iteration.
+
+## Testing and quality checks
+
+Tests are offline and do not require a Gemini key or network access:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+The suite covers:
+
+- preprocessing, slang, emoji cues, and code-mix ratios;
+- entity extraction and canonicalization;
+- Pydantic schema and prompt validation;
+- split reproducibility and few-shot leakage prevention;
+- baseline training, persistence, and prediction;
+- retry, rate-limit, repair, fallback, cache, and telemetry behavior;
+- evaluation metrics and generated artifacts; and
+- Streamlit import and AppTest rendering, including mock mode and developer-details opt-in behavior.
+
+Before opening a pull request, run the full suite and at least one mock prediction. For changes to evaluation or prompts, run a limited mock evaluation first:
+
+```bash
+python main.py evaluate --mock --limit 10
+```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: streamlit`
+
+Activate the project environment and install requirements:
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+On macOS Homebrew Python may be externally managed. Use a virtual environment; do not install project packages into the system interpreter.
+
+### Gemini says the model was not found
+
+Model availability and free-tier access change. Check the current model ID in Google AI Studio and update `llm.model`. The current default is `gemini-3.5-flash-lite`. Older 2.5 Flash-Lite accounts may receive a 404 because Google restricts some 2.5 model access for new users.
+
+### Gemini rejects the response schema
+
+Use the current `src.backends.GeminiBackend`, which sends the sanitized schema generated by `_gemini_response_schema`. Do not revert to passing `Extraction.model_json_schema()` unchanged because Gemini rejects `additionalProperties`.
+
+### API key errors or permission errors
+
+Confirm that `.env` contains `GEMINI_API_KEY=...`, that the process is running from the project directory, and that the key belongs to a region/account allowed to use the selected model. Use `--mock` while diagnosing the rest of the application.
+
+### Rate limits or slow evaluations
+
+Use `--mock`, reduce `--limit`, evaluate one prompt with `--prompts v3`, lower concurrency, or rely on the cache for repeated requests. Do not treat a mock report as a Gemini benchmark.
+
+### Baseline is missing
+
+Run `python main.py split` followed by `python main.py train-baseline`. The UI can still demonstrate LLM/mock predictions without the baseline.
+
+### Stale results or cache entries
+
+Results are files, not live views of the current code. Re-run evaluation after changing prompts or model configuration. To invalidate all local cached LLM responses, remove `.cache/`; cached files are ignored by Git.
+
+## Security and privacy
+
+- Never commit `.env`, API keys, generated caches, or customer data.
+- The API key is read from `GEMINI_API_KEY`; it is not hard-coded or included in prompts.
+- The seed dataset is synthetic and contains no intended customer records.
+- Real messages may contain order IDs, amounts, or personal information. Add redaction, access control, retention policy, and provider review before using this project with production data.
+- The generated error files copy raw and preprocessed messages, so treat `results/` as potentially sensitive when evaluating real data.
+
+## Extending the project
+
+### Add a prompt version
+
+1. Copy an existing YAML file under `prompts/`.
+2. Change `version`, description, changelog, system prompt, and examples.
+3. Ensure every few-shot output passes the `Extraction` schema.
+4. Run `pytest`, then `python main.py evaluate --mock --prompts <version> --limit 10`.
+5. Tune on dev and freeze before evaluating test.
+
+### Add an intent or entity type
+
+Update the relevant `Literal` in `src/schemas.py`, label-space constants, prompt instructions and examples, mock rules, baseline/evaluation assumptions, and tests. For a new regex entity, update both normalization and extraction in `src/entities.py` and add exact-match test cases.
+
+### Add a backend
+
+Implement the `LLMBackend` protocol's async `generate(LLMRequest) -> LLMResponse` method. Keep transport concerns in the backend; retries, caching, validation, and telemetry belong in `LLMClient`. Add a deterministic fake or scripted backend for tests instead of making tests call a live service.
+
+### Add a UI field
+
+Keep business logic in `src/ui_helpers.py` or the pipeline and keep `app.py` as a thin rendering layer. Add an AppTest assertion for the visible behavior and preserve the default non-technical view unless the field is intended for developers.
+
+## Reproducibility checklist
+
+For a result that another developer can reproduce:
+
+1. Record the Git revision and Python version.
+2. Record the exact `config/config.yaml`, prompt files, and model ID.
+3. Run `python main.py split` with the configured seed.
+4. Run `python main.py train-baseline`.
+5. Run the same `evaluate` command, including split, prompt list, limit, and mock/real mode.
+6. Preserve `results/metrics.json`, the Markdown report, and error files.
+7. For real Gemini runs, record the run date because model availability, quotas, and service behavior change.
+
+## License and contribution note
+
+No license file is currently included in this repository. Add an explicit license before distributing the project beyond its intended private or educational use. Contributions should include focused tests and should avoid committing `.env`, `.cache/`, model artifacts, or generated result files unless the change specifically documents them.
